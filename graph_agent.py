@@ -553,10 +553,8 @@ class AndroidAgent:
         print(f"✓ Connected: {device.serial}")
         
         # Initialize components
-        print("Fetching installed apps...")
         self.app_library = AppLibrary(device_address)
         self.app_library.fetch_installed_apps()
-        print(f"✓ Found {len(self.app_library.apps)} apps")
         
         self.vision = VisionModule(device)
         self.executor = ActionExecutor(device, self.vision, self.app_library)
@@ -742,4 +740,3 @@ class AndroidAgent:
         """Disconnect from the device."""
         if self.connection:
             self.connection.disconnect()
-            print("Disconnected")
