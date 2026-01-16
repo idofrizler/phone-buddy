@@ -146,7 +146,8 @@ def search_installed_apps(query: str) -> str:
         return f"No apps found matching '{query}'"
     lines = [f"Apps matching '{query}':"]
     for app in matches[:10]:
-        lines.append(f"  - {app.common_name}: {app.package_name}")
+        name = app.display_name or app.common_name
+        lines.append(f"  - {name}: {app.package_name}")
     return "\n".join(lines)
 
 
@@ -693,7 +694,8 @@ class AndroidAgent:
         
         lines = ["Matching installed apps:"]
         for app in relevant_apps[:10]:
-            lines.append(f"  - {app.common_name}: {app.package_name}")
+            name = app.display_name or app.common_name
+            lines.append(f"  - {name}: {app.package_name}")
         return "\n".join(lines)
     
     def interactive_mode(self):

@@ -1,9 +1,14 @@
 """App Library for managing installed Android applications."""
 
+import json
+import os
 import re
+import shutil
 import subprocess
-from dataclasses import dataclass
-from typing import List, Optional
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional
 from thefuzz import fuzz, process
 
 
@@ -11,10 +16,17 @@ from thefuzz import fuzz, process
 class AppInfo:
     """Information about an installed app."""
     package_name: str
-    common_name: str
+    common_name: str  # Derived from package name
+    display_name: Optional[str] = None  # Actual app label from APK
     
     def __str__(self):
-        return f"{self.common_name} ({self.package_name})"
+        name = self.display_name or self.common_name
+        return f"{name} ({self.package_name})"
+    
+    @property
+    def best_name(self) -> str:
+        """Get the best available name for this app."""
+        return self.display_name or self.common_name
 
 
 class AppLibrary:
@@ -91,11 +103,67 @@ class AppLibrary:
         "com.coinbase.android": "Coinbase",
     }
     
+    # Cache file for app labels
+    CACHE_DIR = Path.home() / ".cache" / "phone-buddy"
+    CACHE_FILE = CACHE_DIR / "app_labels.json"
+    
     def __init__(self, device_address: str):
         self.device_address = device_address
         self.apps: List[AppInfo] = []
+        self.label_cache: Dict[str, str] = {}
+        self._aapt_path = self._find_aapt()
+        self._load_label_cache()
     
-    def _run_adb(self, args: list[str]) -> tuple[bool, str]:
+    def _find_aapt(self) -> Optional[str]:
+        """Find aapt binary on the system."""
+        # Check if aapt is in PATH
+        aapt = shutil.which("aapt")
+        if aapt:
+            return aapt
+        
+        # Check common Android SDK locations
+        possible_paths = [
+            "/opt/homebrew/share/android-commandlinetools/build-tools/34.0.0/aapt",
+            "/opt/homebrew/share/android-commandlinetools/build-tools/33.0.0/aapt",
+            os.path.expanduser("~/Library/Android/sdk/build-tools/34.0.0/aapt"),
+            os.path.expanduser("~/Library/Android/sdk/build-tools/33.0.0/aapt"),
+        ]
+        
+        # Also check ANDROID_HOME
+        android_home = os.environ.get("ANDROID_HOME", "")
+        if android_home:
+            build_tools = Path(android_home) / "build-tools"
+            if build_tools.exists():
+                for version_dir in sorted(build_tools.iterdir(), reverse=True):
+                    aapt_path = version_dir / "aapt"
+                    if aapt_path.exists():
+                        return str(aapt_path)
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                return path
+        
+        return None
+    
+    def _load_label_cache(self):
+        """Load cached app labels from disk."""
+        if self.CACHE_FILE.exists():
+            try:
+                with open(self.CACHE_FILE, "r") as f:
+                    self.label_cache = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self.label_cache = {}
+    
+    def _save_label_cache(self):
+        """Save app labels cache to disk."""
+        self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self.CACHE_FILE, "w") as f:
+                json.dump(self.label_cache, f, indent=2)
+        except IOError:
+            pass
+    
+    def _run_adb(self, args: List[str]) -> tuple[bool, str]:
         """Run an ADB command targeting the specific device."""
         try:
             result = subprocess.run(
@@ -107,6 +175,63 @@ class AppLibrary:
             return result.returncode == 0, result.stdout.strip()
         except Exception as e:
             return False, str(e)
+    
+    def _get_app_label(self, package_name: str) -> Optional[str]:
+        """Get the display label for an app using aapt."""
+        # Check cache first
+        if package_name in self.label_cache:
+            return self.label_cache[package_name]
+        
+        if not self._aapt_path:
+            return None
+        
+        try:
+            # Get APK path
+            success, output = self._run_adb(["shell", "pm", "path", package_name])
+            if not success or not output:
+                return None
+            
+            # Get first APK path (base.apk)
+            apk_path = output.split("\n")[0].replace("package:", "").strip()
+            
+            # Pull APK to temp location
+            with tempfile.NamedTemporaryFile(suffix=".apk", delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                result = subprocess.run(
+                    ["adb", "-s", self.device_address, "pull", apk_path, tmp_path],
+                    capture_output=True,
+                    timeout=30
+                )
+                if result.returncode != 0:
+                    return None
+                
+                # Use aapt to get label
+                result = subprocess.run(
+                    [self._aapt_path, "dump", "badging", tmp_path],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                
+                if result.returncode == 0:
+                    for line in result.stdout.split("\n"):
+                        if line.startswith("application-label:"):
+                            label = line.split(":", 1)[1].strip().strip("'\"")
+                            self.label_cache[package_name] = label
+                            return label
+            finally:
+                # Clean up temp file
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                    
+        except Exception:
+            pass
+        
+        return None
     
     def _package_to_common_name(self, package_name: str) -> str:
         """Convert a package name to a human-readable common name."""
@@ -138,7 +263,11 @@ class AppLibrary:
         return any(package_name.startswith(prefix) for prefix in self.IGNORED_PREFIXES)
     
     def fetch_installed_apps(self) -> List[AppInfo]:
-        """Fetch all user-installed apps from the device."""
+        """Fetch all user-installed apps from the device.
+        
+        Labels are fetched via aapt and cached to disk. First run will be slow,
+        subsequent runs will be fast as labels are loaded from cache.
+        """
         print("Fetching installed apps...")
         
         # Get third-party packages (-3 flag)
@@ -149,6 +278,7 @@ class AppLibrary:
             return []
         
         self.apps = []
+        packages_to_process = []
         
         for line in output.splitlines():
             if line.startswith("package:"):
@@ -158,8 +288,7 @@ class AppLibrary:
                 if self._should_ignore(package_name):
                     continue
                 
-                common_name = self._package_to_common_name(package_name)
-                self.apps.append(AppInfo(package_name, common_name))
+                packages_to_process.append(package_name)
         
         # Also fetch some useful system apps (Google apps, etc.)
         success, output = self._run_adb(["shell", "cmd", "package", "list", "packages", "-s"])
@@ -178,11 +307,31 @@ class AppLibrary:
             for line in output.splitlines():
                 if line.startswith("package:"):
                     package_name = line[8:].strip()
-                    if package_name in useful_system_apps:
-                        common_name = self._package_to_common_name(package_name)
-                        # Avoid duplicates
-                        if not any(app.package_name == package_name for app in self.apps):
-                            self.apps.append(AppInfo(package_name, common_name))
+                    if package_name in useful_system_apps and package_name not in packages_to_process:
+                        packages_to_process.append(package_name)
+        
+        # Determine which packages need label fetching
+        packages_needing_labels = [p for p in packages_to_process if p not in self.label_cache]
+        
+        # Fetch labels for new packages only
+        if packages_needing_labels and self._aapt_path:
+            total_new = len(packages_needing_labels)
+            print(f"  Fetching labels for {total_new} new apps (cached: {len(packages_to_process) - total_new})...")
+            
+            for i, package_name in enumerate(packages_needing_labels):
+                if (i + 1) % 20 == 0 or i == 0:
+                    print(f"    Progress: {i + 1}/{total_new}")
+                self._get_app_label(package_name)
+            
+            # Save updated cache
+            self._save_label_cache()
+            print(f"  ✓ Cached {total_new} new app labels")
+        
+        # Build app list with labels from cache
+        for package_name in packages_to_process:
+            common_name = self._package_to_common_name(package_name)
+            display_name = self.label_cache.get(package_name)
+            self.apps.append(AppInfo(package_name, common_name, display_name))
         
         print(f"✓ Found {len(self.apps)} apps")
         return self.apps
@@ -196,12 +345,17 @@ class AppLibrary:
         query_lower = query.lower()
         
         for app in self.apps:
+            # Check display name match (if available)
+            display_score = 0
+            if app.display_name:
+                display_score = fuzz.partial_ratio(query_lower, app.display_name.lower())
+            
             # Check common name match
             common_score = fuzz.partial_ratio(query_lower, app.common_name.lower())
             # Check package name match
             package_score = fuzz.partial_ratio(query_lower, app.package_name.lower())
             
-            best_score = max(common_score, package_score)
+            best_score = max(display_score, common_score, package_score)
             
             if best_score >= threshold:
                 results.append((app, best_score))
@@ -225,10 +379,13 @@ class AppLibrary:
         
         lines = []
         for app in self.apps[:max_apps]:
-            lines.append(f"- {app.common_name}: {app.package_name}")
+            name = app.display_name or app.common_name
+            lines.append(f"- {name}: {app.package_name}")
         
         if len(self.apps) > max_apps:
             lines.append(f"... and {len(self.apps) - max_apps} more apps")
+        
+        return "\n".join(lines)
         
         return "\n".join(lines)
     
