@@ -303,28 +303,28 @@ def create_agent_graph(
         last_result = state.get("last_result", "")
         last_action = state.get("last_action", "")
         
-        if state.get("step_count", 0) > 1:
-            # Build context message
-            context_parts = []
+        # Build context message with current screen state
+        context_parts = []
+        
+        # Add previous action results if any
+        if last_action and last_result:
+            context_parts.append(f"[Previous action]: {last_action}")
+            context_parts.append(f"[Result]: {last_result}")
             
-            if last_action and last_result:
-                context_parts.append(f"[Previous action]: {last_action}")
-                context_parts.append(f"[Result]: {last_result}")
-                
-                # Check if the task appears complete
-                if "Opened" in last_result and "open" in state.get("user_goal", "").lower():
-                    context_parts.append("[Status]: ✓ App was successfully opened. Respond to confirm completion.")
-            
-            if current_app:
-                context_parts.append(f"[Current app on screen]: {current_app}")
-            
-            if screen:
-                # Only include screen state if needed (truncate if long)
-                screen_summary = screen[:1500] if len(screen) > 1500 else screen
-                context_parts.append(f"[Screen UI elements]:\n{screen_summary}")
-            
-            if context_parts:
-                messages.append(HumanMessage(content="\n".join(context_parts)))
+            # Check if the task appears complete
+            if "Opened" in last_result and "open" in state.get("user_goal", "").lower():
+                context_parts.append("[Status]: ✓ App was successfully opened. Respond to confirm completion.")
+        
+        if current_app:
+            context_parts.append(f"[Current app on screen]: {current_app}")
+        
+        # Always include screen state so agent can see what's on screen
+        if screen:
+            screen_summary = screen[:3000] if len(screen) > 3000 else screen
+            context_parts.append(f"[Screen UI elements]:\n{screen_summary}")
+        
+        if context_parts:
+            messages.append(HumanMessage(content="\n".join(context_parts)))
         
         try:
             response = llm_with_tools.invoke(messages)
@@ -369,7 +369,7 @@ def create_agent_graph(
             if tool_name in tool_map:
                 try:
                     result = tool_map[tool_name].invoke(tool_args)
-                    logger.debug(f"Tool result: {result[:200] if len(result) > 200 else result}")
+                    logger.debug(f"Tool result: {result[:500] if len(result) > 500 else result}")
                 except Exception as e:
                     result = f"Error executing {tool_name}: {e}"
                     logger.error(result)
