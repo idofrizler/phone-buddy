@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -116,6 +117,8 @@ class AppLibrary:
         self.label_cache: Dict[str, str] = {}
         self._aapt_path = self._find_aapt()
         self._load_label_cache()
+        self._label_fetch_thread: Optional[threading.Thread] = None
+        self._label_fetch_lock = threading.Lock()
     
     def _find_aapt(self) -> Optional[str]:
         """Find aapt binary on the system."""
@@ -292,11 +295,34 @@ class AppLibrary:
         """Check if a package should be ignored."""
         return any(package_name.startswith(prefix) for prefix in self.IGNORED_PREFIXES)
     
+    def _fetch_labels_background(self, packages: List[str]):
+        """Fetch labels for packages in the background."""
+        new_labels: Dict[str, str] = {}
+        total = len(packages)
+        
+        for i, package_name in enumerate(packages):
+            if (i + 1) % 20 == 0 or i == 0:
+                print(f"  [Background] Fetching app labels: {i + 1}/{total}")
+            label = self._get_app_label(package_name)
+            if label:
+                new_labels[package_name] = label
+                # Update the app in our list with the new label
+                with self._label_fetch_lock:
+                    for app in self.apps:
+                        if app.package_name == package_name:
+                            app.display_name = label
+                            break
+        
+        # Save updated cache (including to bundled file)
+        if new_labels:
+            self._save_label_cache(new_labels)
+            print(f"  [Background] ✓ Cached {len(new_labels)} new app labels")
+    
     def fetch_installed_apps(self) -> List[AppInfo]:
         """Fetch all user-installed apps from the device.
         
-        Labels are fetched via aapt and cached to disk. First run will be slow,
-        subsequent runs will be fast as labels are loaded from cache.
+        Labels are loaded from cache immediately. Any missing labels are
+        fetched in the background without blocking.
         """
         print("Fetching installed apps...")
         
@@ -340,33 +366,27 @@ class AppLibrary:
                     if package_name in useful_system_apps and package_name not in packages_to_process:
                         packages_to_process.append(package_name)
         
-        # Determine which packages need label fetching
-        packages_needing_labels = [p for p in packages_to_process if p not in self.label_cache]
-        
-        # Fetch labels for new packages only
-        new_labels: Dict[str, str] = {}
-        if packages_needing_labels and self._aapt_path:
-            total_new = len(packages_needing_labels)
-            print(f"  Fetching labels for {total_new} new apps (cached: {len(packages_to_process) - total_new})...")
-            
-            for i, package_name in enumerate(packages_needing_labels):
-                if (i + 1) % 20 == 0 or i == 0:
-                    print(f"    Progress: {i + 1}/{total_new}")
-                label = self._get_app_label(package_name)
-                if label:
-                    new_labels[package_name] = label
-            
-            # Save updated cache (including to bundled file)
-            self._save_label_cache(new_labels)
-            print(f"  ✓ Cached {len(new_labels)} new app labels")
-        
-        # Build app list with labels from cache
+        # Build app list immediately with cached labels (or None if not cached)
         for package_name in packages_to_process:
             common_name = self._package_to_common_name(package_name)
             display_name = self.label_cache.get(package_name)
             self.apps.append(AppInfo(package_name, common_name, display_name))
         
+        # Determine which packages need label fetching
+        packages_needing_labels = [p for p in packages_to_process if p not in self.label_cache]
+        
         print(f"✓ Found {len(self.apps)} apps")
+        
+        # Fetch missing labels in background
+        if packages_needing_labels and self._aapt_path:
+            print(f"  ({len(packages_needing_labels)} apps need labels - fetching in background)")
+            self._label_fetch_thread = threading.Thread(
+                target=self._fetch_labels_background,
+                args=(packages_needing_labels,),
+                daemon=True
+            )
+            self._label_fetch_thread.start()
+        
         return self.apps
     
     def fuzzy_find_app(self, query: str, threshold: int = 60) -> List[AppInfo]:
