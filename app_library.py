@@ -103,9 +103,12 @@ class AppLibrary:
         "com.coinbase.android": "Coinbase",
     }
     
-    # Cache file for app labels
+    # Cache file for app labels (user-specific)
     CACHE_DIR = Path.home() / ".cache" / "phone-buddy"
     CACHE_FILE = CACHE_DIR / "app_labels.json"
+    
+    # Bundled known apps file (shared, ships with repo)
+    KNOWN_APPS_FILE = Path(__file__).parent / "known_apps.json"
     
     def __init__(self, device_address: str):
         self.device_address = device_address
@@ -146,22 +149,49 @@ class AppLibrary:
         return None
     
     def _load_label_cache(self):
-        """Load cached app labels from disk."""
-        if self.CACHE_FILE.exists():
+        """Load cached app labels from bundled file and user cache."""
+        # Start with bundled known apps
+        if self.KNOWN_APPS_FILE.exists():
             try:
-                with open(self.CACHE_FILE, "r") as f:
+                with open(self.KNOWN_APPS_FILE, "r") as f:
                     self.label_cache = json.load(f)
             except (json.JSONDecodeError, IOError):
                 self.label_cache = {}
+        
+        # Merge with user-specific cache (user cache takes precedence)
+        if self.CACHE_FILE.exists():
+            try:
+                with open(self.CACHE_FILE, "r") as f:
+                    user_cache = json.load(f)
+                    self.label_cache.update(user_cache)
+            except (json.JSONDecodeError, IOError):
+                pass
     
-    def _save_label_cache(self):
-        """Save app labels cache to disk."""
+    def _save_label_cache(self, new_labels: Dict[str, str] = None):
+        """Save app labels to both user cache and bundled file."""
+        # Save to user cache
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
         try:
             with open(self.CACHE_FILE, "w") as f:
-                json.dump(self.label_cache, f, indent=2)
+                json.dump(self.label_cache, f, indent=2, ensure_ascii=False)
         except IOError:
             pass
+        
+        # Also update the bundled known_apps.json with new entries
+        if new_labels and self.KNOWN_APPS_FILE.exists():
+            try:
+                # Load current bundled file
+                with open(self.KNOWN_APPS_FILE, "r") as f:
+                    bundled = json.load(f)
+                
+                # Add new labels
+                bundled.update(new_labels)
+                
+                # Save back
+                with open(self.KNOWN_APPS_FILE, "w") as f:
+                    json.dump(bundled, f, indent=2, ensure_ascii=False)
+            except (json.JSONDecodeError, IOError):
+                pass
     
     def _run_adb(self, args: List[str]) -> tuple[bool, str]:
         """Run an ADB command targeting the specific device."""
@@ -314,6 +344,7 @@ class AppLibrary:
         packages_needing_labels = [p for p in packages_to_process if p not in self.label_cache]
         
         # Fetch labels for new packages only
+        new_labels: Dict[str, str] = {}
         if packages_needing_labels and self._aapt_path:
             total_new = len(packages_needing_labels)
             print(f"  Fetching labels for {total_new} new apps (cached: {len(packages_to_process) - total_new})...")
@@ -321,11 +352,13 @@ class AppLibrary:
             for i, package_name in enumerate(packages_needing_labels):
                 if (i + 1) % 20 == 0 or i == 0:
                     print(f"    Progress: {i + 1}/{total_new}")
-                self._get_app_label(package_name)
+                label = self._get_app_label(package_name)
+                if label:
+                    new_labels[package_name] = label
             
-            # Save updated cache
-            self._save_label_cache()
-            print(f"  ✓ Cached {total_new} new app labels")
+            # Save updated cache (including to bundled file)
+            self._save_label_cache(new_labels)
+            print(f"  ✓ Cached {len(new_labels)} new app labels")
         
         # Build app list with labels from cache
         for package_name in packages_to_process:
